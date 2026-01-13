@@ -1,52 +1,99 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware # <--- 1. Tambah ini
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
 
-app = FastAPI()
+# --- 1. SETUP DATABASE (SQLAlchemy) ---
+from sqlalchemy import create_engine, Column, Integer, String, Boolean
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
 
-# --- 2. Tambah blok ini (Setting CORS) ---
-# Ini biar React (port 5173) boleh ngobrol sama Python (port 8000)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Buka untuk semua alamat (aman buat belajar)
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-# ------------------------------------------
+# Bikin file database bernama "task.db" di folder yg sama
+SQLALCHEMY_DATABASE_URL = "sqlite:///./tasks.db"
 
-class Task(BaseModel):
-    id: Optional[int] = None
+# Bikin mesin database
+engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+# --- 2. DEFINISI TABEL (Model Database) ---
+class TaskDB(Base):
+    __tablename__ = "tasks" # Nama tabel di database
+
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String, index=True)
+    description = Column(String)
+    is_completed = Column(Boolean, default=False)
+
+# Bikin tabelnya otomatis kalau belum ada
+Base.metadata.create_all(bind=engine)
+
+# --- 3. DEFINISI DATA API (Pydantic) ---
+# Ini buat validasi data yg keluar-masuk API
+class TaskSchema(BaseModel):
+    id: int
+    title: str
+    description: str
+    is_completed: bool
+
+    class Config:
+        # Biar Pydantic bisa baca data dari SQLAlchemy
+        orm_mode = True 
+
+class TaskCreate(BaseModel):
     title: str
     description: str
     is_completed: bool = False
 
-fake_db = [
-    {"id": 1, "title": "Belajar FastAPI", "description": "Bikin API pertama", "is_completed": False}
-]
+# --- 4. SERVER SETUP ---
+app = FastAPI()
 
-@app.get("/tasks", response_model=List[Task])
-def get_all_tasks():
-    return fake_db
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-@app.get("/tasks/{task_id}", response_model=Task)
-def get_task(task_id: int):
-    task = next((t for t in fake_db if t["id"] == task_id), None)
-    if task is None:
-        raise HTTPException(status_code=404, detail="Tugas tidak ditemukan")
-    return task
+# Dependency: Buat koneksi ke DB tiap ada request, terus tutup lagi
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
-@app.post("/tasks", response_model=Task)
-def create_task(task: Task):
-    new_id = fake_db[-1]["id"] + 1 if fake_db else 1
-    new_task = task.dict()
-    new_task["id"] = new_id
-    fake_db.append(new_task)
+# --- 5. ENDPOINTS (CRUD dengan Database) ---
+
+# GET: Ambil semua data dari tabel
+@app.get("/tasks", response_model=List[TaskSchema])
+def get_tasks(db: Session = Depends(get_db)):
+    return db.query(TaskDB).all()
+
+# POST: Simpan ke tabel
+@app.post("/tasks", response_model=TaskSchema)
+def create_task(task: TaskCreate, db: Session = Depends(get_db)):
+    # Bikin objek database baru
+    new_task = TaskDB(
+        title=task.title,
+        description=task.description,
+        is_completed=task.is_completed
+    )
+    db.add(new_task)  # Masukin ke antrian
+    db.commit()       # Simpan permanen (Save)
+    db.refresh(new_task) # Ambil ID yang baru digenerate
     return new_task
 
+# DELETE: Hapus dari tabel
 @app.delete("/tasks/{task_id}")
-def delete_task(task_id: int):
-    global fake_db
-    fake_db = [t for t in fake_db if t["id"] != task_id]
-    return {"msg": "Tugas berhasil dihapus"}
+def delete_task(task_id: int, db: Session = Depends(get_db)):
+    # Cari task berdasarkan ID
+    task = db.query(TaskDB).filter(TaskDB.id == task_id).first()
+    
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    db.delete(task)
+    db.commit() # Jangan lupa commit biar perubahannya disimpan
+    return {"msg": "Berhasil dihapus dari Database"}
